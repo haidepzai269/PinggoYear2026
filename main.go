@@ -82,6 +82,10 @@ var (
 	newsCache = make(map[string]CacheEntry)
 	mapCache  = make(map[string]CacheEntry) // Cache cho tìm kiếm địa điểm
 	mutex     = &sync.RWMutex{}
+
+	// 🔥 CACHE ẢNH BẢN ĐỒ (RAM) - ĐÂY LÀ PHẦN QUAN TRỌNG BẠN ĐANG THIẾU 🔥
+	tileCache = make(map[string][]byte)
+	tileMutex = &sync.RWMutex{}
 )
 
 // --- MIDDLEWARE ---
@@ -202,7 +206,6 @@ func getMapSearchHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(results)
 }
 
-// 🔥 HANDLER 4: TILE PROXY + CLOUDFLARE OPTIMIZATION
 func getMapTileHandler(w http.ResponseWriter, r *http.Request) {
 	enableCors(&w)
 	if r.Method == "OPTIONS" { return }
@@ -212,11 +215,27 @@ func getMapTileHandler(w http.ResponseWriter, r *http.Request) {
 	y := r.URL.Query().Get("y")
 
 	if z == "" || x == "" || y == "" {
-		http.Error(w, "Thiếu tham số z, x, y", http.StatusBadRequest)
+		http.Error(w, "Thiếu tham số", http.StatusBadRequest)
 		return
 	}
 
-	// URL lấy ảnh 512px từ TomTom
+	// Tạo key cache
+	cacheKey := fmt.Sprintf("%s/%s/%s", z, x, y)
+
+	// 1. Kiểm tra RAM xem có ảnh chưa
+	tileMutex.RLock()
+	cachedImage, found := tileCache[cacheKey]
+	tileMutex.RUnlock()
+
+	if found {
+		// Có rồi -> Trả luôn
+		w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(cachedImage)
+		return
+	}
+
+	// 2. Chưa có -> Gọi TomTom
 	tomtomURL := fmt.Sprintf("%s/%s/%s/%s.png?key=%s&tileSize=512&view=Unified&language=vi-VN",
 		TOMTOM_TILE_URL, z, x, y, TOMTOM_API_KEY)
 
@@ -228,19 +247,25 @@ func getMapTileHandler(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		http.Error(w, "TomTom không trả về ảnh", resp.StatusCode)
+		http.Error(w, "TomTom Error", resp.StatusCode)
 		return
 	}
 
-	// 🔥 CẤU HÌNH CACHE CHO CLOUDFLARE (QUAN TRỌNG NHẤT) 🔥
-	// public: Cho phép CDN (Cloudflare) cache
-	// max-age=604800: Lưu 7 ngày (7 * 24 * 60 * 60)
-	// immutable: Cam kết ảnh này không bao giờ thay đổi (đỡ phải check lại)
+	imgData, _ := io.ReadAll(resp.Body)
+
+	// 3. Lưu vào RAM
+	tileMutex.Lock()
+	// Nếu RAM đầy (2000 ảnh) thì xóa bớt đi
+	if len(tileCache) > 2000 {
+		tileCache = make(map[string][]byte)
+	}
+	tileCache[cacheKey] = imgData
+	tileMutex.Unlock()
+
+	// 4. Trả về Client
 	w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
 	w.Header().Set("Content-Type", "image/png")
-
-	// Đẩy dữ liệu ảnh về
-	io.Copy(w, resp.Body)
+	w.Write(imgData)
 }
 
 func fetchFromTomTom(query string) (*TomTomResponse, error) {
