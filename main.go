@@ -215,7 +215,7 @@ func getMapTileHandler(w http.ResponseWriter, r *http.Request) {
 	y := r.URL.Query().Get("y")
 
 	if z == "" || x == "" || y == "" {
-		http.Error(w, "Thiếu tham số", http.StatusBadRequest)
+		http.Error(w, "Thiếu tham số z, x, y", http.StatusBadRequest)
 		return
 	}
 
@@ -228,44 +228,49 @@ func getMapTileHandler(w http.ResponseWriter, r *http.Request) {
 	tileMutex.RUnlock()
 
 	if found {
-		// Có rồi -> Trả luôn
+		// [HIT] Có rồi -> Trả luôn
 		w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
 		w.Header().Set("Content-Type", "image/png")
 		w.Write(cachedImage)
 		return
 	}
 
-	// 2. Chưa có -> Gọi TomTom
-	tomtomURL := fmt.Sprintf("%s/%s/%s/%s.png?key=%s&tileSize=512&view=Unified&language=vi-VN",
+	// 2. [MISS] Chưa có -> Gọi TomTom
+	// Rút gọn URL: Bỏ view và language để tránh lỗi 400
+	tomtomURL := fmt.Sprintf("%s/%s/%s/%s.png?key=%s&tileSize=512",
 		TOMTOM_TILE_URL, z, x, y, TOMTOM_API_KEY)
 
 	resp, err := http.Get(tomtomURL)
 	if err != nil {
-		http.Error(w, "Lỗi kết nối TomTom", http.StatusBadGateway)
+		http.Error(w, "Lỗi kết nối TomTom: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
+	// Đọc body trả về (ảnh hoặc lỗi)
+	bodyData, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode != 200 {
-		http.Error(w, "TomTom Error", resp.StatusCode)
+		// 🔥 QUAN TRỌNG: Trả về nguyên văn lỗi từ TomTom để debug 🔥
+		// Ví dụ: TomTom có thể báo "Invalid API Key" hoặc "Parameter invalid"
+		errMsg := fmt.Sprintf("TomTom Error (%d): %s", resp.StatusCode, string(bodyData))
+		fmt.Println(errMsg) // In ra log của Render
+		http.Error(w, errMsg, resp.StatusCode)
 		return
 	}
 
-	imgData, _ := io.ReadAll(resp.Body)
-
 	// 3. Lưu vào RAM
 	tileMutex.Lock()
-	// Nếu RAM đầy (2000 ảnh) thì xóa bớt đi
 	if len(tileCache) > 2000 {
-		tileCache = make(map[string][]byte)
+		tileCache = make(map[string][]byte) // Xóa bớt nếu đầy
 	}
-	tileCache[cacheKey] = imgData
+	tileCache[cacheKey] = bodyData
 	tileMutex.Unlock()
 
 	// 4. Trả về Client
 	w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
 	w.Header().Set("Content-Type", "image/png")
-	w.Write(imgData)
+	w.Write(bodyData)
 }
 
 func fetchFromTomTom(query string) (*TomTomResponse, error) {
